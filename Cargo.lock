@@ -1924,6 +1924,7 @@ dependencies = [
  "prometheus",
  "prost",
  "serde_json",
+ "serde_yaml",
  "tempfile",
  "tokio",
  "tokio-util",
