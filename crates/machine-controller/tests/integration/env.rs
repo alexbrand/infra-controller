@@ -23,6 +23,7 @@ use carbide_machine_controller::handler::{
     MachineStateHandlerBuilder, PowerOptionConfig, ReachabilityParams,
 };
 use carbide_machine_controller::io::MachineStateControllerIO;
+use carbide_redfish::libredfish::RedfishClientPool;
 use carbide_redfish::libredfish::test_support::RedfishSim;
 use carbide_secrets::credentials::CredentialManager;
 use carbide_test_harness::prelude::*;
@@ -36,15 +37,21 @@ use tokio_util::sync::CancellationToken;
 pub(super) struct Env {
     pub(super) test_harness: TestHarness,
     pub(super) redfish_sim: Arc<RedfishSim>,
+    /// The controller services' credential store.
+    pub(super) credential_manager: Arc<dyn CredentialManager>,
     machine_controller: StateController<MachineStateControllerIO>,
     _cancel_token: CancellationToken,
 }
+
+type ControllerRedfishPool =
+    Box<dyn FnOnce(Arc<RedfishSim>, Arc<dyn CredentialManager>) -> Arc<dyn RedfishClientPool>>;
 
 pub(super) struct EnvBuilder {
     pool: PgPool,
     runtime_config: CarbideConfig,
     component_manager: Option<Arc<ComponentManager>>,
     credential_manager: Option<Arc<dyn CredentialManager>>,
+    controller_redfish_pool: Option<ControllerRedfishPool>,
 }
 
 impl Env {
@@ -60,11 +67,20 @@ impl Env {
             runtime_config,
             component_manager: None,
             credential_manager: None,
+            controller_redfish_pool: None,
         }
     }
 
     pub(super) async fn run_single_iteration(&mut self) {
         self.machine_controller.run_single_iteration().boxed().await;
+    }
+
+    /// Processes each host once so intermediate states remain observable.
+    pub(super) async fn run_single_iteration_without_requeue(&mut self) {
+        self.machine_controller
+            .run_single_iteration_ext(false)
+            .boxed()
+            .await;
     }
 }
 
@@ -87,6 +103,15 @@ impl EnvBuilder {
         credential_manager: Arc<dyn CredentialManager>,
     ) -> Self {
         self.credential_manager = Some(credential_manager);
+        self
+    }
+
+    pub(super) fn with_controller_redfish_pool(
+        mut self,
+        pool: impl FnOnce(Arc<RedfishSim>, Arc<dyn CredentialManager>) -> Arc<dyn RedfishClientPool>
+        + 'static,
+    ) -> Self {
+        self.controller_redfish_pool = Some(Box::new(pool));
         self
     }
 
@@ -116,6 +141,7 @@ impl EnvBuilder {
             runtime_config,
             component_manager,
             credential_manager,
+            controller_redfish_pool,
         } = self;
         let controller_redfish_sim = redfish_sim.clone();
         let runtime_config = Arc::new(runtime_config);
@@ -135,7 +161,7 @@ impl EnvBuilder {
             uefi_boot_wait: runtime_config.machine_state_controller.uefi_boot_wait,
         };
         let power_options: PowerOptionConfig = runtime_config.power_manager_options.clone().into();
-        let machine_handler = MachineStateHandlerBuilder::builder()
+        let machine_handler = MachineStateHandlerBuilder::builder(api.instrumentation().clone())
             .dpu_up_threshold(runtime_config.machine_state_controller.dpu_up_threshold)
             .dpu_nic_firmware_reprovision_update_enabled(
                 runtime_config
@@ -166,16 +192,23 @@ impl EnvBuilder {
                 .clone(),
             std::time::Duration::from_secs(60),
         );
+        let credential_manager =
+            credential_manager.unwrap_or_else(|| api.credential_manager().clone());
+        let redfish_client_pool: Arc<dyn RedfishClientPool> = match controller_redfish_pool {
+            Some(pool) => pool(controller_redfish_sim.clone(), credential_manager.clone()),
+            None => controller_redfish_sim.clone(),
+        };
         let services = MachineStateHandlerServices {
+            instrumentation: api.instrumentation().clone(),
             db_pool: pool.clone(),
             db_reader: pool.clone().into(),
-            redfish_client_pool: controller_redfish_sim.clone(),
+            redfish_client_pool: redfish_client_pool.clone(),
+            bmc_connector: bmc_backend::BmcConnector::Libredfish(redfish_client_pool),
             bmc_credential_ops: controller_redfish_sim,
             ipmi_tool: carbide_ipmi::test_support(),
             site_config: runtime_config.machine_state_handler_site_config().into(),
             component_manager,
-            credential_manager: credential_manager
-                .unwrap_or_else(|| api.credential_manager().clone()),
+            credential_manager: credential_manager.clone(),
             // Zero TTL: every guard re-queries the aggregate so tests observe a
             // freshly staged rotation on the next iteration without waiting out
             // the cache window.
@@ -194,6 +227,7 @@ impl EnvBuilder {
                 db::credential_rotation::CredentialRotationType::DpuUefi,
             ),
             // Zero TTL for the same reason as the BMC gate above.
+            dpf_per_dpu_bmc_credentials: false,
             dpu_bmc_service_rotation_gate:
                 carbide_credential_rotation::RotationGate::with_ttl_and_family(
                     std::time::Duration::ZERO,
@@ -208,7 +242,7 @@ impl EnvBuilder {
             per_object_info: None,
         };
         let machine_controller = StateController::<MachineStateControllerIO>::builder()
-            .database(pool, api.work_lock_manager_handle())
+            .database(pool, api.work_lock_manager_handle(), api.instrumentation())
             .meter("carbide_machines", test_harness.test_meter.meter())
             .processor_id(uuid::Uuid::new_v4().to_string())
             .services(Arc::new(services))
@@ -226,6 +260,7 @@ impl EnvBuilder {
         Env {
             test_harness,
             redfish_sim,
+            credential_manager,
             machine_controller,
             _cancel_token: cancel_token,
         }
