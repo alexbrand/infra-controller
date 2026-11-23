@@ -310,8 +310,7 @@ impl TestApiBuilder {
         ));
         let real_endpoint_explorer = carbide_site_explorer::new_bmc_explorer(
             real_bmc_client.clone(),
-            Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            false,
+            &runtime_config.site_explorer,
             self.db_pool.clone(),
             self.instrumentation.clone(),
         );

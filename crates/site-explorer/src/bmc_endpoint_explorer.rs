@@ -23,6 +23,7 @@ use std::time::Duration;
 use bmc_explorer::Product;
 use bmc_platform::{LockdownDesiredState, NicMode, PowerState, ResetType};
 use bmc_runtime::DriverConnector;
+use carbide_hw_identification::host_serial::HostSerialRules;
 use carbide_ipmi::IPMITool;
 use carbide_redfish::boot_interface::BootInterfaceTarget;
 use carbide_redfish::libredfish::BmcCredentialOps;
@@ -128,6 +129,7 @@ pub struct BmcEndpointExplorer {
     rotate_switch_nvos_credentials: Arc<AtomicBool>,
     /// Whether nv-redfish reports include drive firmware inventory entries.
     explore_drive_firmware: bool,
+    host_serial_rules: HostSerialRules,
     dpf_per_dpu_bmc_credentials: AtomicBool,
     /// Used to record per-device BMC rotation convergence at the moment the
     /// device is moved onto the site-wide BMC root (see
@@ -151,6 +153,7 @@ impl BmcEndpointExplorer {
             bmc_client,
             rotate_switch_nvos_credentials,
             explore_drive_firmware: false,
+            host_serial_rules: HostSerialRules::default(),
             dpf_per_dpu_bmc_credentials: AtomicBool::new(false),
             database_connection,
         }
@@ -160,6 +163,11 @@ impl BmcEndpointExplorer {
     /// entries; off unless set.
     pub fn with_drive_firmware(mut self, explore_drive_firmware: bool) -> Self {
         self.explore_drive_firmware = explore_drive_firmware;
+        self
+    }
+
+    pub(super) fn with_host_serial_rules(mut self, rules: HostSerialRules) -> Self {
+        self.host_serial_rules = rules;
         self
     }
 
@@ -374,6 +382,7 @@ impl BmcEndpointExplorer {
                 access,
                 boot_interface,
                 self.explore_drive_firmware,
+                &|chassis| self.host_serial_rules.needs_chassis_assembly(&chassis.id),
             )
             .await
     }

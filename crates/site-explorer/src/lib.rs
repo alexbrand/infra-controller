@@ -117,7 +117,6 @@ use model::network_segment::NetworkSegmentType;
 use model::rack::Rack;
 pub mod config;
 pub mod errors;
-use std::sync::atomic::AtomicBool;
 
 use errors::{SiteExplorerError, SiteExplorerResult};
 
@@ -160,18 +159,18 @@ fn should_scan_underlay_interface_for_redfish(
 /// while the explorer runs.
 pub fn new_bmc_explorer(
     bmc_client: Arc<AuthenticatedBmcClient>,
-    rotate_switch_nvos_credentials: Arc<AtomicBool>,
-    explore_drive_firmware: bool,
+    config: &SiteExplorerConfig,
     database_connection: PgPool,
     instrumentation: carbide_instrument::Instrumentation,
 ) -> Arc<BmcEndpointExplorer> {
     BmcEndpointExplorer::new(
         bmc_client,
-        rotate_switch_nvos_credentials,
+        config.rotate_switch_nvos_credentials.clone(),
         Some(database_connection),
         instrumentation,
     )
-    .with_drive_firmware(explore_drive_firmware)
+    .with_drive_firmware(config.explore_drive_firmware)
+    .with_host_serial_rules(config.host_serial_rules.clone())
     .into()
 }
 
@@ -1070,17 +1069,9 @@ impl SiteExplorer {
             if let Some(expected_machine) = expected_machine {
                 let expected_sn = &expected_machine.data.serial_number;
 
-                // Check expected vs actual serial number
-                // using the primary system serial number.
-                // If nothing found, try again with chassis
-                // serial numbers.
                 if !ep
                     .report
-                    .primary_system()
-                    .is_some_and(|s| s.check_serial_number(expected_sn) || s.check_sku(expected_sn))
-                    && !ep.report.chassis.iter().any(|chassis| {
-                        chassis.inventory_serial_number() == Some(expected_sn.as_str())
-                    })
+                    .matches_expected_serial_number(expected_sn, &self.config.host_serial_rules)
                 {
                     metrics
                         .increment_endpoint_explorations_expected_serial_number_mismatches_overall_count(
@@ -1094,7 +1085,7 @@ impl SiteExplorer {
                             target: Some(ep.address.to_string()),
                             in_alert_since: None,
                             message: format!(
-                                "Expected serial number {expected_sn} can not be found"
+                                "Explored inventory does not match expected serial number {expected_sn}"
                             ),
                             tenant_message: None,
                             classifications: vec![
